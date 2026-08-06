@@ -265,29 +265,87 @@
     document.body.appendChild(wrapper);
 
     try {
+      // ---- Pontos seguros de quebra (medidos no DOM, antes de rasterizar) ----
+      // Página 1 deve conter só o cabeçalho/assinaturas/testemunhas; as cláusulas
+      // (table.doc-clauses) sempre começam na página 2. Nas páginas seguintes,
+      // evitamos cortar no meio de um parágrafo/cláusula sempre que possível.
+      const docBodyEl = clone.querySelector('#docBody');
+      const clausesTable = docBodyEl ? docBodyEl.querySelector('.doc-clauses') : null;
+      const cloneTop = clone.getBoundingClientRect().top;
+      const relTop = (el) => el.getBoundingClientRect().top - cloneTop;
+
+      const breakPointsCss = new Set();
+      if (docBodyEl) {
+        Array.from(docBodyEl.children).forEach((el) => breakPointsCss.add(relTop(el)));
+      }
+      if (clausesTable) {
+        Array.from(clausesTable.querySelectorAll('tr')).forEach((tr) => {
+          breakPointsCss.add(relTop(tr));
+          const td = tr.querySelector('td');
+          if (td) Array.from(td.children).forEach((child) => breakPointsCss.add(relTop(child)));
+        });
+      }
+      const cloneHeightCss = clone.getBoundingClientRect().height;
+      breakPointsCss.add(cloneHeightCss);
+      const clauseStartCss = clausesTable ? relTop(clausesTable) : null;
+
       const canvas = await html2canvas(clone, { scale: 2, backgroundColor: '#ffffff' });
-      const imgData = canvas.toDataURL('image/png');
       const { jsPDF } = window.jspdf;
       const pdf = new jsPDF({ unit: 'pt', format: 'a4' });
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
 
-      // Documento pode ter mais de uma página — fatia o canvas em blocos de altura A4
-      const pxPerPage = Math.floor((canvas.width * pageHeight) / pageWidth);
-      let renderedHeight = 0;
-      let first = true;
-      while (renderedHeight < canvas.height) {
-        const sliceHeight = Math.min(pxPerPage, canvas.height - renderedHeight);
+      // Margem de respiro no topo/rodapé de cada página impressa
+      const MARGIN_TOP_PT = 36;
+      const MARGIN_BOTTOM_PT = 36;
+      const ptPerCanvasPx = pageWidth / canvas.width;
+      const usablePxFirst = MARGIN_BOTTOM_PT / ptPerCanvasPx >= canvas.height
+        ? canvas.height
+        : (pageHeight - MARGIN_BOTTOM_PT) / ptPerCanvasPx;
+      const usablePxOther = (pageHeight - MARGIN_TOP_PT - MARGIN_BOTTOM_PT) / ptPerCanvasPx;
+
+      const scaleFactor = canvas.width / clone.getBoundingClientRect().width;
+      const breakPointsPx = Array.from(breakPointsCss).map((v) => v * scaleFactor).sort((a, b) => a - b);
+      const clauseStartPx = clauseStartCss != null ? clauseStartCss * scaleFactor : null;
+
+      function findBreak(start, maxEnd) {
+        let best = null;
+        for (const bp of breakPointsPx) {
+          if (bp > start && bp <= maxEnd) best = bp;
+          if (bp > maxEnd) break;
+        }
+        // só usa o ponto seguro se ele não deixar a página curta demais (<35% do espaço disponível)
+        if (best && (best - start) >= (maxEnd - start) * 0.35) return best;
+        return maxEnd;
+      }
+
+      function drawSlice(startPx, heightPx, isFirst) {
         const sliceCanvas = document.createElement('canvas');
         sliceCanvas.width = canvas.width;
-        sliceCanvas.height = sliceHeight;
+        sliceCanvas.height = heightPx;
         const ctx = sliceCanvas.getContext('2d');
-        ctx.drawImage(canvas, 0, renderedHeight, canvas.width, sliceHeight, 0, 0, canvas.width, sliceHeight);
+        ctx.drawImage(canvas, 0, startPx, canvas.width, heightPx, 0, 0, canvas.width, heightPx);
         const sliceData = sliceCanvas.toDataURL('image/png');
         const drawWidth = pageWidth;
-        const drawHeight = (sliceHeight * drawWidth) / canvas.width;
-        if (!first) pdf.addPage();
-        pdf.addImage(sliceData, 'PNG', 0, 0, drawWidth, drawHeight);
+        const drawHeight = heightPx * ptPerCanvasPx;
+        const topOffsetPt = isFirst ? 0 : MARGIN_TOP_PT;
+        if (!isFirst) pdf.addPage();
+        pdf.addImage(sliceData, 'PNG', 0, topOffsetPt, drawWidth, drawHeight);
+      }
+
+      let renderedHeight = 0;
+      let first = true;
+      while (renderedHeight < canvas.height - 0.5) {
+        const capacityPx = first ? usablePxFirst : usablePxOther;
+        const maxEnd = Math.min(canvas.height, renderedHeight + capacityPx);
+        let end;
+        if (first && clauseStartPx != null && clauseStartPx > renderedHeight && clauseStartPx <= maxEnd) {
+          end = clauseStartPx; // força fim da página 1 exatamente antes das cláusulas
+        } else {
+          end = findBreak(renderedHeight, maxEnd);
+        }
+        const sliceHeight = Math.max(1, Math.round(end - renderedHeight));
+        drawSlice(renderedHeight, sliceHeight, first);
         renderedHeight += sliceHeight;
         first = false;
       }
